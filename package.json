@@ -1,0 +1,102 @@
+{
+  "name": "r-plot-pro",
+  "displayName": "R Plot Pro",
+  "description": "The ultimate R visualization experience for VS Code. High-performance, real-time, and designed for professionals who demand the best of RStudio and Positron.",
+  "version": "0.0.1",
+  "license": "MIT",
+  "publisher": "ofurkancoban",
+  "icon": "assets/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ofurkancoban/RPlotPro"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Visualization",
+    "Data Science"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "rPlotViewer.showPlot",
+        "title": "R Plot Pro: Show Viewer",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "rPlotViewer.clearPlot",
+        "title": "R Plot: Clear Plot",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "rPlotViewer.exportPlot",
+        "title": "R Plot: Export Plot",
+        "icon": "$(save)"
+      },
+      {
+        "command": "rPlotViewer.previousPlot",
+        "title": "R Plot: Previous Plot",
+        "icon": "$(chevron-left)"
+      },
+      {
+        "command": "rPlotViewer.nextPlot",
+        "title": "R Plot: Next Plot",
+        "icon": "$(chevron-right)"
+      }
+    ],
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "rPlotViewerBottomPanel",
+          "title": "R Plot Pro",
+          "icon": "$(graph)"
+        }
+      ]
+    },
+    "views": {
+      "rPlotViewerBottomPanel": [
+        {
+          "type": "webview",
+          "id": "rPlotViewer.mainView",
+          "name": "R Plot Pro",
+          "icon": "$(graph)"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "R Plot Pro",
+      "properties": {
+        "rPlotViewer.autoShow": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically show plot viewer when a plot is created"
+        },
+        "rPlotViewer.defaultWidth": {
+          "type": "number",
+          "default": 800,
+          "description": "Default plot width in pixels"
+        },
+        "rPlotViewer.defaultHeight": {
+          "type": "number",
+          "default": 600,
+          "description": "Default plot height in pixels"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.0.0"
+  }
+}
