@@ -1,7 +1,7 @@
 # R Plot Pro
 
 <p align="center">
-  <img src="https://github.com/ofurkancoban/RPlotPro/blob/main/assets/icon.png" width="128" alt="R Plot Pro Logo">
+  <img src="https://github.com/ofurkancoban/RPlotPro/blob/main/assets/icon.png" width="250" alt="R Plot Pro Logo">
 </p>
 
 <p align="center">
