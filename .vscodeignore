@@ -1,0 +1,11 @@
+**/.DS_Store
+task.md
+.r_plot_config.json
+src/**
+**/*.ts
+tsconfig.json
+node_modules/@types/**
+node_modules/typescript/**
+node_modules/.bin/**
+node_modules/.package-lock.json
+*.vsix

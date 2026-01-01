@@ -2,6 +2,18 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import WebSocket = require('ws');
+
+async function resolveWebSocketUrl(port: number): Promise<string> {
+    const fallback = `ws://127.0.0.1:${port}`;
+    try {
+        const externalUri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://127.0.0.1:${port}`));
+        const wsScheme = externalUri.scheme === 'https' ? 'wss' : 'ws';
+        return externalUri.with({ scheme: wsScheme }).toString();
+    } catch {
+        return fallback;
+    }
+}
 
 export function activate(context: vscode.ExtensionContext) {
     const plotProvider = new PlotViewProvider(context.extensionUri);
@@ -45,6 +57,9 @@ export function activate(context: vscode.ExtensionContext) {
 
             panel.webview.html = plotProvider._getHtmlForWebview(panel.webview);
 
+            const panelRegistration = plotProvider.registerWebview(panel.webview);
+            panel.onDidDispose(() => panelRegistration.dispose());
+
             // Move to a separate floating window
             // Use minimal delay (100ms) for fast window opening while avoiding race conditions
             setTimeout(() => {
@@ -62,9 +77,17 @@ export function activate(context: vscode.ExtensionContext) {
                         const content = fs.readFileSync(sessionConfigPath, 'utf8');
                         const config = JSON.parse(content);
                         if (config.port) {
-                            panel.webview.postMessage({ command: 'set_port', port: config.port });
+                            resolveWebSocketUrl(config.port).then(wsUrl => {
+                                panel.webview.postMessage({ command: 'set_port', port: config.port, wsUrl });
+                            });
                         }
                     }
+                } else if (message.command === 'ws_proxy_connect') {
+                    if (typeof message.port === 'number') {
+                        plotProvider.startProxy(message.port);
+                    }
+                } else if (message.command === 'ws_proxy_send') {
+                    plotProvider.sendToProxy(message.data);
                 } else if (message.command === 'open_new_window') {
                     vscode.commands.executeCommand('rPlotViewer.openGallery');
                 } else if (message.command === 'request_export') {
@@ -116,7 +139,7 @@ export function activate(context: vscode.ExtensionContext) {
                 const content = fs.readFileSync(configPath, 'utf8');
                 const config = JSON.parse(content);
                 if (config.port) {
-                    plotProvider.postMessage({ command: 'set_port', port: config.port });
+                    plotProvider.updateConnection(config.port);
                 }
             }
         } catch (e) {
@@ -230,7 +253,12 @@ export function deactivate() { }
 class PlotViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'rPlotViewer.mainView';
     private _view?: vscode.WebviewView;
+    private readonly _webviews = new Set<vscode.Webview>();
     public sessionConfigPath?: string;
+    private _connectionUpdateSeq = 0;
+    private _proxyPort: number | null = null;
+    private _proxySocket: WebSocket | null = null;
+    private _proxyReconnectTimer: NodeJS.Timeout | null = null;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -252,12 +280,23 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
             localResourceRoots: [this._extensionUri]
         };
 
+        const registration = this.registerWebview(webviewView.webview);
+        webviewView.onDidDispose(() => registration.dispose());
+
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
         webviewView.webview.onDidReceiveMessage(message => {
             switch (message.command) {
                 case 'request_config':
                     this.checkAndSendConfig();
+                    break;
+                case 'ws_proxy_connect':
+                    if (typeof message.port === 'number') {
+                        this.startProxy(message.port);
+                    }
+                    break;
+                case 'ws_proxy_send':
+                    this.sendToProxy(message.data);
                     break;
                 case 'open_new_window':
                     vscode.commands.executeCommand('rPlotViewer.openGallery');
@@ -289,13 +328,18 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    public registerWebview(webview: vscode.Webview): vscode.Disposable {
+        this._webviews.add(webview);
+        return { dispose: () => this._webviews.delete(webview) };
+    }
+
     private checkAndSendConfig() {
         try {
             if (this.sessionConfigPath && fs.existsSync(this.sessionConfigPath)) {
                 const content = fs.readFileSync(this.sessionConfigPath, 'utf8');
                 const config = JSON.parse(content);
                 if (config.port) {
-                    this.postMessage({ command: 'set_port', port: config.port });
+                    this.updateConnection(config.port);
                     return;
                 }
             }
@@ -306,12 +350,125 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
                     const content = fs.readFileSync(configPath, 'utf8');
                     const config = JSON.parse(content);
                     if (config.port) {
-                        this.postMessage({ command: 'set_port', port: config.port });
+                        this.updateConnection(config.port);
                     }
                 }
             }
         } catch (e) {
             console.error('Error reading plot config on request:', e);
+        }
+    }
+
+    public updateConnection(port: number) {
+        const seq = ++this._connectionUpdateSeq;
+        resolveWebSocketUrl(port)
+            .then(wsUrl => {
+                if (seq !== this._connectionUpdateSeq) return;
+                this.postMessage({ command: 'set_port', port, wsUrl });
+            })
+            .catch(() => {
+                if (seq !== this._connectionUpdateSeq) return;
+                this.postMessage({ command: 'set_port', port, wsUrl: `ws://127.0.0.1:${port}` });
+            });
+    }
+
+    private broadcastMessage(message: any) {
+        for (const webview of this._webviews) {
+            try {
+                webview.postMessage(message);
+            } catch {
+                // Ignore disposed webviews
+            }
+        }
+    }
+
+    private stopProxy() {
+        if (this._proxyReconnectTimer) {
+            clearTimeout(this._proxyReconnectTimer);
+            this._proxyReconnectTimer = null;
+        }
+        if (this._proxySocket) {
+            try {
+                this._proxySocket.removeAllListeners();
+                this._proxySocket.close();
+            } catch {
+                // ignore
+            }
+            this._proxySocket = null;
+        }
+        this._proxyPort = null;
+        this.broadcastMessage({ command: 'ws_proxy_status', connected: false });
+    }
+
+    private connectProxy() {
+        if (this._proxyReconnectTimer) {
+            clearTimeout(this._proxyReconnectTimer);
+            this._proxyReconnectTimer = null;
+        }
+        if (this._proxySocket) {
+            try {
+                this._proxySocket.removeAllListeners();
+                this._proxySocket.close();
+            } catch {
+                // ignore
+            }
+            this._proxySocket = null;
+        }
+        if (!this._proxyPort) return;
+
+        const url = `ws://127.0.0.1:${this._proxyPort}/`;
+        const socket = new WebSocket(url);
+        this._proxySocket = socket;
+
+        socket.on('open', () => {
+            this.broadcastMessage({ command: 'ws_proxy_status', connected: true });
+            try {
+                socket.send(JSON.stringify({ type: 'get_plots' }));
+            } catch {
+                // ignore
+            }
+        });
+
+        socket.on('message', (data: WebSocket.RawData) => {
+            try {
+                const text = typeof data === 'string' ? data : data.toString();
+                const parsed = JSON.parse(text);
+                this.broadcastMessage({ command: 'ws_proxy_message', data: parsed });
+            } catch {
+                // ignore
+            }
+        });
+
+        const scheduleReconnect = () => {
+            this.broadcastMessage({ command: 'ws_proxy_status', connected: false });
+            if (!this._proxyPort) return;
+            this._proxyReconnectTimer = setTimeout(() => this.connectProxy(), 2000);
+        };
+
+        socket.on('close', scheduleReconnect);
+        socket.on('error', scheduleReconnect);
+    }
+
+    public startProxy(port: number) {
+        if (!Number.isFinite(port) || port <= 0) return;
+        if (this._proxyPort === port && this._proxySocket && this._proxySocket.readyState === WebSocket.OPEN) {
+            this.broadcastMessage({ command: 'ws_proxy_status', connected: true });
+            return;
+        }
+        this._proxyPort = port;
+        this.connectProxy();
+    }
+
+    public sendToProxy(data: any) {
+        if (!this._proxyPort) return;
+        if (!this._proxySocket || this._proxySocket.readyState !== WebSocket.OPEN) {
+            this.connectProxy();
+            return;
+        }
+        try {
+            this._proxySocket.send(JSON.stringify(data));
+        } catch {
+            // ignore
         }
     }
 
@@ -353,7 +510,7 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src ws://localhost:* ws://127.0.0.1:*;">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src ws: wss:;">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>R Plot Viewer</title>
     <style>
@@ -1113,15 +1270,39 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
         const vscode = acquireVsCodeApi();
         let plots = [];
         const state = vscode.getState() || {};
-        let currentIndex = typeof state.currentIndex === 'number' ? state.currentIndex : -1;
-        let ws = null;
-        let reconnectTimer = null;
-        let currentPort = ${port};
-        let resizeTimeout;
-        let showOnlyFavorites = false;
+	        let currentIndex = typeof state.currentIndex === 'number' ? state.currentIndex : -1;
+	        let ws = null;
+	        let reconnectTimer = null;
+	        let connectTimeout = null;
+	        let currentPort = ${port};
+	        let currentWsUrl = null;
+	        let useProxy = false;
+	        let resizeTimeout;
+	        let showOnlyFavorites = false;
         let currentNoteIndex = -1;
 
         function log(msg) { console.log('[R Plot]', msg); }
+
+        function sendBackendMessage(payload) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(payload));
+                return;
+            }
+            if (useProxy) {
+                vscode.postMessage({ command: 'ws_proxy_send', data: payload });
+            }
+        }
+
+	        function startProxyMode() {
+	            if (useProxy) return;
+	            useProxy = true;
+	            if (connectTimeout) clearTimeout(connectTimeout);
+	            connectTimeout = null;
+	            try { if (ws) ws.close(); } catch (e) {}
+	            ws = null;
+	            if (reconnectTimer) clearTimeout(reconnectTimer);
+	            vscode.postMessage({ command: 'ws_proxy_connect', port: currentPort });
+	        }
 
         // Initial layout check before anything else
         refreshLayout();
@@ -1131,28 +1312,48 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
             document.body.style.opacity = '1';
         }, 50);
 
-        window.addEventListener('message', event => {
-            const message = event.data;
-            switch (message.command) {
-                case 'set_port':
-                    if (currentPort !== message.port) {
-                        currentPort = message.port;
-                        connectWebSocket();
+	        window.addEventListener('message', event => {
+	            const message = event.data;
+	            switch (message.command) {
+	                case 'set_port':
+                    {
+                        const nextPort = message.port;
+                        const nextWsUrl = message.wsUrl;
+                        const shouldReconnect = currentPort !== nextPort || (!!nextWsUrl && currentWsUrl !== nextWsUrl);
+                        currentPort = nextPort;
+                        if (typeof nextWsUrl === 'string' && nextWsUrl.length > 0) {
+                            currentWsUrl = nextWsUrl;
+                        }
+                        if (shouldReconnect) connectWebSocket();
                     }
-                    break;
-                case 'set_active_file':
-                    // Forward to R backend
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ 
-                            type: 'set_active_file', 
-                            filePath: message.filePath 
-                        }));
-                    }
-                    break;
-                case 'store_active_file':
-                    // Store in state for WebSocket reconnection
-                    const currentState = vscode.getState() || {};
-                    vscode.setState({ ...currentState, activeFile: message.filePath });
+	                    break;
+	                case 'set_active_file':
+	                    // Forward to R backend
+	                    sendBackendMessage({ 
+	                        type: 'set_active_file', 
+	                        filePath: message.filePath 
+	                    });
+	                    break;
+	                case 'ws_proxy_status':
+	                    if (!useProxy) break;
+	                    updateConnectionStatus(!!message.connected);
+	                    if (message.connected) {
+	                        sendBackendMessage({ type: 'get_plots' });
+	                        const activeFile = vscode.getState()?.activeFile;
+	                        if (activeFile) {
+	                            sendBackendMessage({ type: 'set_active_file', filePath: activeFile });
+	                        }
+	                        setTimeout(() => { refreshLayout(); sendResizeEvent(); }, 100);
+	                    }
+	                    break;
+	                case 'ws_proxy_message':
+	                    if (!useProxy) break;
+	                    if (message.data) handleMessage(message.data);
+	                    break;
+	                case 'store_active_file':
+	                    // Store in state for WebSocket reconnection
+	                    const currentState = vscode.getState() || {};
+	                    vscode.setState({ ...currentState, activeFile: message.filePath });
                     break;
                 case 'next_plot': nextPlot(); break;
                 case 'previous_plot': previousPlot(); break;
@@ -1171,51 +1372,73 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
             };
         }
 
-        function connectWebSocket() {
-            if (ws) {
-                try { ws.close(); } catch(e) {}
-                ws = null;
-            }
-            if (reconnectTimer) clearTimeout(reconnectTimer);
+	        function connectWebSocket() {
+	            if (useProxy) {
+	                vscode.postMessage({ command: 'ws_proxy_connect', port: currentPort });
+	                return;
+	            }
+	            if (ws) {
+	                try { ws.close(); } catch(e) {}
+	                ws = null;
+	            }
+	            if (reconnectTimer) clearTimeout(reconnectTimer);
+	            if (connectTimeout) clearTimeout(connectTimeout);
+	            connectTimeout = null;
 
-            const url = 'ws://127.0.0.1:' + currentPort;
-            
-            try {
-                ws = new WebSocket(url);
+	            const url = (typeof currentWsUrl === 'string' && currentWsUrl.length > 0)
+	                ? currentWsUrl
+	                : ('ws://127.0.0.1:' + currentPort);
+	            
+	            try {
+	                ws = new WebSocket(url);
+	                let didOpen = false;
+	                connectTimeout = setTimeout(() => {
+	                    if (!didOpen) startProxyMode();
+	                }, 2000);
 
-                ws.onopen = () => {
-                    log('Connected');
-                    updateConnectionStatus(true);
-                    ws.send(JSON.stringify({ type: 'get_plots' }));
-                    
-                    // Send active file info after connection established
-                    if (typeof vscode !== 'undefined' && vscode.getState) {
-                        const activeFile = vscode.getState()?.activeFile;
-                        if (activeFile) {
-                            ws.send(JSON.stringify({ 
-                                type: 'set_active_file', 
-                                filePath: activeFile 
-                            }));
-                        }
-                    }
-                    
-                    // Initial resize after small delay to ensure layout is ready
-                    setTimeout(() => { refreshLayout(); sendResizeEvent(); }, 100);
-                };
-                ws.onclose = () => {
-                    updateConnectionStatus(false);
-                    reconnectTimer = setTimeout(() => {
-                         vscode.postMessage({ command: 'request_config' });
-                        connectWebSocket();
-                    }, 2000);
-                };
-                ws.onerror = (e) => {
-                     updateConnectionStatus(false);
-                };
-                ws.onmessage = (event) => {
-                    try {
-                        const data = JSON.parse(event.data);
-                        handleMessage(data);
+	                ws.onopen = () => {
+	                    didOpen = true;
+	                    if (connectTimeout) clearTimeout(connectTimeout);
+	                    connectTimeout = null;
+	                    log('Connected');
+	                    updateConnectionStatus(true);
+	                    sendBackendMessage({ type: 'get_plots' });
+	                    
+	                    // Send active file info after connection established
+	                    if (typeof vscode !== 'undefined' && vscode.getState) {
+	                        const activeFile = vscode.getState()?.activeFile;
+	                        if (activeFile) {
+	                            sendBackendMessage({ 
+	                                type: 'set_active_file', 
+	                                filePath: activeFile 
+	                            });
+	                        }
+	                    }
+	                    
+	                    // Initial resize after small delay to ensure layout is ready
+	                    setTimeout(() => { refreshLayout(); sendResizeEvent(); }, 100);
+	                };
+	                ws.onclose = () => {
+	                    if (connectTimeout) clearTimeout(connectTimeout);
+	                    connectTimeout = null;
+	                    if (useProxy) return;
+	                    updateConnectionStatus(false);
+	                    reconnectTimer = setTimeout(() => {
+	                         vscode.postMessage({ command: 'request_config' });
+	                        connectWebSocket();
+	                    }, 2000);
+	                };
+	                ws.onerror = (e) => {
+	                    if (connectTimeout) clearTimeout(connectTimeout);
+	                    connectTimeout = null;
+	                    if (useProxy) return;
+	                    updateConnectionStatus(false);
+	                    startProxyMode();
+	                };
+	                ws.onmessage = (event) => {
+	                    try {
+	                        const data = JSON.parse(event.data);
+	                        handleMessage(data);
                     } catch (e) {}
                 };
             } catch (e) {
@@ -1478,18 +1701,16 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
         }
         
         // Delete Handler
-        function deletePlot(index, event) {
-            if (event) event.stopPropagation();
-            if (index < 0 || index >= plots.length) return;
-            
-            const pid = plots[index].id;
+	        function deletePlot(index, event) {
+	            if (event) event.stopPropagation();
+	            if (index < 0 || index >= plots.length) return;
+	            
+	            const pid = plots[index].id;
             // Optimistic UI update? No, safer to wait for server sync
             // But we can hide it?
             // Actually server responds fast with 'plot_list', let's just send request
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'delete_plot', plot_id: pid }));
-            }
-        }
+	            sendBackendMessage({ type: 'delete_plot', plot_id: pid });
+	        }
 
         function createPlotItemHTML(plot, index) {
             const isActive = index === currentIndex ? 'active' : '';
@@ -1764,10 +1985,10 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
         function previousPlot() { if (currentIndex > 0) showPlot(currentIndex - 1); }
         function nextPlot() { if (currentIndex < plots.length - 1) showPlot(currentIndex + 1); }
 
-        function clearAllPlots() {
-             if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'clear_all' }));
-             clearLocalPlots();
-        }
+	        function clearAllPlots() {
+	             sendBackendMessage({ type: 'clear_all' });
+	             clearLocalPlots();
+	        }
 
         function exportPlot() {
             if (currentIndex < 0) return;
@@ -1832,46 +2053,44 @@ class PlotViewProvider implements vscode.WebviewViewProvider {
              }
         }
 
-        function refreshPlots() {
-            if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'get_plots' }));
-            sendResizeEvent();
-        }
+	        function refreshPlots() {
+	            sendBackendMessage({ type: 'get_plots' });
+	            sendResizeEvent();
+	        }
 
-        function sendResizeEvent() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                const container = document.getElementById('plotContainer');
-                if (container) {
-                    const containerWidth = Math.floor(container.clientWidth); 
-                    const containerHeight = Math.floor(container.clientHeight);
-                    
-                    // Get current aspect ratio mode
-                    const currentState = vscode.getState() || {};
-                    const aspectRatio = currentState.aspectRatio || 'auto';
-                    
-                    let width = containerWidth;
-                    let height = containerHeight;
-                    
-                    // Calculate dimensions based on aspect ratio mode
-                    if (aspectRatio === 'square') {
-                        const size = Math.min(width, height);
-                        width = size;
-                        height = size;
-                    } else if (aspectRatio === 'landscape') {
-                        height = Math.floor(width / 1.5);
-                    } else if (aspectRatio === 'portrait') {
-                        width = Math.floor(height / 1.5);
-                    }
-                    // For 'auto' and 'fill', use container dimensions as-is
-                    
-                    let pid = null;
-                    if (currentIndex >= 0 && currentIndex < plots.length) pid = plots[currentIndex].id;
-                    
-                    if (width > 50 && height > 50) {
-                        ws.send(JSON.stringify({ type: 'resize', width, height, plot_id: pid }));
-                    }
-                }
-            }
-        }
+	        function sendResizeEvent() {
+	            const container = document.getElementById('plotContainer');
+	            if (container) {
+	                const containerWidth = Math.floor(container.clientWidth); 
+	                const containerHeight = Math.floor(container.clientHeight);
+	                
+	                // Get current aspect ratio mode
+	                const currentState = vscode.getState() || {};
+	                const aspectRatio = currentState.aspectRatio || 'auto';
+	                
+	                let width = containerWidth;
+	                let height = containerHeight;
+	                
+	                // Calculate dimensions based on aspect ratio mode
+	                if (aspectRatio === 'square') {
+	                    const size = Math.min(width, height);
+	                    width = size;
+	                    height = size;
+	                } else if (aspectRatio === 'landscape') {
+	                    height = Math.floor(width / 1.5);
+	                } else if (aspectRatio === 'portrait') {
+	                    width = Math.floor(height / 1.5);
+	                }
+	                // For 'auto' and 'fill', use container dimensions as-is
+	                
+	                let pid = null;
+	                if (currentIndex >= 0 && currentIndex < plots.length) pid = plots[currentIndex].id;
+	                
+	                if (width > 50 && height > 50) {
+	                    sendBackendMessage({ type: 'resize', width, height, plot_id: pid });
+	                }
+	            }
+	        }
         
         window.addEventListener('resize', debounce(() => {
             refreshLayout();

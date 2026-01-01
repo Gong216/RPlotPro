@@ -94,9 +94,13 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./"
   },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
   "devDependencies": {
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.75.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.0.0"
   }
 }
