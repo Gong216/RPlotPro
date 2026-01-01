@@ -18,6 +18,12 @@ async function resolveWebSocketUrl(port) {
         return fallback;
     }
 }
+function getDefaultSavePath(filename) {
+    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+        return vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, filename);
+    }
+    return vscode.Uri.file(path.join(os.homedir(), filename));
+}
 function activate(context) {
     const plotProvider = new PlotViewProvider(context.extensionUri);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('rPlotViewer.mainView', plotProvider, {
@@ -84,12 +90,12 @@ function activate(context) {
             }
             else if (message.command === 'save_data') {
                 vscode.window.showSaveDialog({
-                    filters: { 'Images': [message.format] },
-                    defaultUri: vscode.Uri.file('plot.' + message.format)
+                    filters: { 'Files': [message.format] },
+                    defaultUri: getDefaultSavePath('plot.' + message.format)
                 }).then(uri => {
                     if (uri) {
                         try {
-                            const base64Data = message.data.replace(/^data:image\/\w+;base64,/, "");
+                            const base64Data = message.data.replace(/^data:(image|application)\/[\w+.-]+;base64,/, "");
                             fs.writeFileSync(uri.fsPath, Buffer.from(base64Data, 'base64'));
                             vscode.window.showInformationMessage(`Plot saved as ${message.format.toUpperCase()}`);
                         }
@@ -260,12 +266,12 @@ class PlotViewProvider {
                     break;
                 case 'save_data':
                     vscode.window.showSaveDialog({
-                        filters: { 'Images': [message.format] },
-                        defaultUri: vscode.Uri.file('plot.' + message.format)
+                        filters: { 'Files': [message.format] },
+                        defaultUri: getDefaultSavePath('plot.' + message.format)
                     }).then(uri => {
                         if (uri) {
                             try {
-                                const base64Data = message.data.replace(/^data:image\/\w+;base64,/, "");
+                                const base64Data = message.data.replace(/^data:(image|application)\/[\w+.-]+;base64,/, "");
                                 fs.writeFileSync(uri.fsPath, Buffer.from(base64Data, 'base64'));
                                 vscode.window.showInformationMessage(`Plot saved as ${message.format.toUpperCase()}`);
                             }
@@ -586,6 +592,51 @@ class PlotViewProvider {
             height: 16px;
             background: var(--border-color);
             margin: 0 4px;
+        }
+
+        /* Dimension Controls */
+        .dimension-panel {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 0 8px;
+            border-left: 1px solid var(--border-color);
+            margin-left: 4px;
+        }
+
+        .dimension-panel input[type="number"] {
+            width: 80px;
+            height: 24px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 3px;
+            padding: 0 6px;
+            font-size: 11px;
+        }
+
+        .dimension-panel input:focus {
+            outline: 1px solid var(--accent);
+        }
+
+        .dimension-panel span {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .dimension-panel button {
+            height: 24px;
+            padding: 0 10px;
+            background: var(--button-bg);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+
+        .dimension-panel button:hover {
+            background: var(--button-hover);
         }
 
         /* Responsive Layout Logic */
@@ -1137,6 +1188,24 @@ class PlotViewProvider {
 
             <div class="separator"></div>
 
+            <button class="icon-btn" onclick="toggleDimensionMode()" id="dimensionModeBtn" title="Dimension Mode: Auto">
+                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 3h18v18H3z"/><path d="M9 9h6v6H9z"/>
+                </svg>
+            </button>
+
+            <div class="dimension-panel" id="dimensionPanel" style="display: none;">
+                <input type="number" id="widthInput" placeholder="Width (in)" min="1" max="50" step="0.5" />
+                <span>×</span>
+                <input type="number" id="heightInput" placeholder="Height (in)" min="1" max="50" step="0.5" />
+                <span>@</span>
+                <input type="number" id="ppiInput" placeholder="PPI" min="72" max="600" step="1" value="300" style="width: 60px;" />
+                <span>PPI</span>
+                <button onclick="applyCustomDimensions()">Apply</button>
+            </div>
+
+            <div class="separator"></div>
+
             <button class="icon-btn" onclick="openInNewWindow()" id="newWindowBtn" title="Open plots gallery in new window" disabled>
                 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-window-maximize"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M3 16m0 1a1 1 0 0 1 1 -1h3a1 1 0 0 1 1 1v3a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1z" /><path d="M4 12v-6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-6" /><path d="M12 8h4v4" /><path d="M16 8l-5 5" /></svg>
             </button>
@@ -1229,6 +1298,10 @@ class PlotViewProvider {
 	        let resizeTimeout;
 	        let showOnlyFavorites = false;
         let currentNoteIndex = -1;
+        let dimensionMode = state.dimensionMode || 'auto';
+        let customWidth = state.customWidth || 8;
+        let customHeight = state.customHeight || 6;
+        let customPPI = state.customPPI || 300;
 
         function log(msg) { console.log('[R Plot]', msg); }
 
@@ -1471,7 +1544,7 @@ class PlotViewProvider {
                             isFavorite: savedMetadata?.isFavorite || false
                         };
                     });
-                    
+
                     rehydratePlots();
                     break;
             }
@@ -1563,6 +1636,24 @@ class PlotViewProvider {
                  plotImage.classList.add('aspect-' + state.aspectRatio);
                  if (state.aspectRatio !== 'auto') {
                      aspectBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-ruler-2-off"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M12.03 7.97l4.97 -4.97l4 4l-5 5m-2 2l-7 7l-4 -4l7 -7" /><path d="M16 7l-1.5 -1.5" /><path d="M13 10l-1.5 -1.5" /><path d="M10 13l-1.5 -1.5" /><path d="M7 16l-1.5 -1.5" /><path d="M3 3l18 18" /></svg>';
+                 }
+             }
+
+             // Restore dimension mode state
+             if (state.dimensionMode === 'custom') {
+                 dimensionMode = 'custom';
+                 customWidth = state.customWidth || 8;
+                 customHeight = state.customHeight || 6;
+                 customPPI = state.customPPI || 300;
+                 const panel = document.getElementById('dimensionPanel');
+                 const btn = document.getElementById('dimensionModeBtn');
+                 if (panel && btn) {
+                     panel.style.display = 'flex';
+                     btn.title = 'Dimension Mode: Custom';
+                     btn.style.color = 'var(--accent)';
+                     document.getElementById('widthInput').value = customWidth;
+                     document.getElementById('heightInput').value = customHeight;
+                     document.getElementById('ppiInput').value = customPPI;
                  }
              }
 
@@ -1896,7 +1987,70 @@ class PlotViewProvider {
             // Trigger resize to redraw plot with new aspect ratio
             setTimeout(() => sendResizeEvent(), 100);
         }
-        
+
+        function toggleDimensionMode() {
+            const panel = document.getElementById('dimensionPanel');
+            const btn = document.getElementById('dimensionModeBtn');
+            const currentState = vscode.getState() || {};
+
+            if (dimensionMode === 'auto') {
+                dimensionMode = 'custom';
+                panel.style.display = 'flex';
+                document.getElementById('widthInput').value = customWidth;
+                document.getElementById('heightInput').value = customHeight;
+                document.getElementById('ppiInput').value = customPPI;
+                btn.title = 'Dimension Mode: Custom';
+                btn.style.color = 'var(--accent)';
+            } else {
+                dimensionMode = 'auto';
+                panel.style.display = 'none';
+                btn.title = 'Dimension Mode: Auto';
+                btn.style.color = '';
+                sendResizeEvent();
+            }
+            vscode.setState({ ...currentState, dimensionMode });
+        }
+
+        function applyCustomDimensions() {
+            const widthInput = document.getElementById('widthInput');
+            const heightInput = document.getElementById('heightInput');
+            const ppiInput = document.getElementById('ppiInput');
+
+            const widthInches = parseFloat(widthInput.value);
+            const heightInches = parseFloat(heightInput.value);
+            const ppi = parseInt(ppiInput.value, 10);
+
+            if (isNaN(widthInches) || widthInches < 1 || widthInches > 50) {
+                alert('Width must be between 1 and 50 inches');
+                return;
+            }
+            if (isNaN(heightInches) || heightInches < 1 || heightInches > 50) {
+                alert('Height must be between 1 and 50 inches');
+                return;
+            }
+            if (isNaN(ppi) || ppi < 72 || ppi > 600) {
+                alert('PPI must be between 72 and 600');
+                return;
+            }
+
+            customWidth = widthInches;
+            customHeight = heightInches;
+            customPPI = ppi;
+
+            const currentState = vscode.getState() || {};
+            vscode.setState({ ...currentState, customWidth, customHeight, customPPI });
+
+            // Convert inches to pixels using PPI
+            const widthPixels = Math.round(widthInches * ppi);
+            const heightPixels = Math.round(heightInches * ppi);
+
+            let pid = null;
+            if (currentIndex >= 0 && currentIndex < plots.length) {
+                pid = plots[currentIndex].id;
+            }
+            sendBackendMessage({ type: 'resize', width: widthPixels, height: heightPixels, plot_id: pid });
+        }
+
         function showAspectNotification(aspectRatio) {
             const notification = document.getElementById('aspectNotification');
             if (!notification) return;
@@ -2009,17 +2163,27 @@ class PlotViewProvider {
 
 	        function sendResizeEvent() {
 	            const container = document.getElementById('plotContainer');
-	            if (container) {
-	                const containerWidth = Math.floor(container.clientWidth); 
+	            if (!container) return;
+
+	            let width, height;
+
+	            // Check if using custom dimensions
+	            if (dimensionMode === 'custom') {
+	                // Convert inches to pixels using PPI
+	                width = Math.round(customWidth * customPPI);
+	                height = Math.round(customHeight * customPPI);
+	            } else {
+	                // Use container-based sizing (existing logic)
+	                const containerWidth = Math.floor(container.clientWidth);
 	                const containerHeight = Math.floor(container.clientHeight);
-	                
+
 	                // Get current aspect ratio mode
 	                const currentState = vscode.getState() || {};
 	                const aspectRatio = currentState.aspectRatio || 'auto';
-	                
-	                let width = containerWidth;
-	                let height = containerHeight;
-	                
+
+	                width = containerWidth;
+	                height = containerHeight;
+
 	                // Calculate dimensions based on aspect ratio mode
 	                if (aspectRatio === 'square') {
 	                    const size = Math.min(width, height);
@@ -2031,13 +2195,13 @@ class PlotViewProvider {
 	                    width = Math.floor(height / 1.5);
 	                }
 	                // For 'auto' and 'fill', use container dimensions as-is
-	                
-	                let pid = null;
-	                if (currentIndex >= 0 && currentIndex < plots.length) pid = plots[currentIndex].id;
-	                
-	                if (width > 50 && height > 50) {
-	                    sendBackendMessage({ type: 'resize', width, height, plot_id: pid });
-	                }
+	            }
+
+	            let pid = null;
+	            if (currentIndex >= 0 && currentIndex < plots.length) pid = plots[currentIndex].id;
+
+	            if (width > 50 && height > 50) {
+	                sendBackendMessage({ type: 'resize', width, height, plot_id: pid });
 	            }
 	        }
         
